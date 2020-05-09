@@ -31,6 +31,11 @@
 
 这将提供将Log数据请求作为JSON对象发送到外部Kafka集群的功能。
 
+该插件提供了将Log Data作为批处理推送到外部Kafka主题的功能。如果您没有收到日志数据，请放心一些时间，它会在我们的批处理处理器中的计时器功能到期后自动发送日志。
+
+有关Apache APISIX中Batch-Processor的更多信息，请参考。
+[Batch-Processor](../batch-processor-cn.md)
+
 ## 属性列表
 
 |属性名称          |必选项  |描述|
@@ -76,9 +81,8 @@
 1. 这是有关如何为特定路由启用kafka-logger插件的示例。
 
 ```shell
-curl http://127.0.0.1:9080/apisix/admin/consumers -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1' -X PUT -d '
+curl http://127.0.0.1:9080/apisix/admin/routes/5 -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1' -X PUT -d '
 {
-    "username": "foo",
     "plugins": {
        "kafka-logger": {
            "broker_list" :

@@ -27,13 +27,10 @@ __DATA__
 --- config
     location /t {
         content_by_lua_block {
-            local plugin = require("apisix.plugins.kafka-logger")
+            local plugin = require("apisix.plugins.syslog")
             local ok, err = plugin.check_schema({
-                 kafka_topic = "test",
-                 key = "key1",
-                 broker_list = {
-                    ["127.0.0.1"] = 3
-                 }
+                 host = "127.0.0.1",
+                 port = 3000,
             })
             if not ok then
                 ngx.say(err)
@@ -50,12 +47,12 @@ done
 
 
 
-=== TEST 2: missing broker list
+=== TEST 2: missing port
 --- config
     location /t {
         content_by_lua_block {
-            local plugin = require("apisix.plugins.kafka-logger")
-            local ok, err = plugin.check_schema({kafka_topic = "test", key= "key1"})
+            local plugin = require("apisix.plugins.syslog")
+            local ok, err = plugin.check_schema({host = "127.0.0.1"})
             if not ok then
                 ngx.say(err)
             end
@@ -65,7 +62,7 @@ done
 --- request
 GET /t
 --- response_body
-property "broker_list" is required
+property "port" is required
 done
 --- no_error_log
 [error]
@@ -76,14 +73,10 @@ done
 --- config
     location /t {
         content_by_lua_block {
-            local plugin = require("apisix.plugins.kafka-logger")
+            local plugin = require("apisix.plugins.syslog")
             local ok, err = plugin.check_schema({
-                broker_list = {
-                    ["127.0.0.1"] = 3000
-                },
-                timeout = "10",
-                kafka_topic ="test",
-                key= "key1"
+                 host = "127.0.0.1",
+                 port = "3000",
             })
             if not ok then
                 ngx.say(err)
@@ -94,7 +87,7 @@ done
 --- request
 GET /t
 --- response_body
-property "timeout" validation failed: wrong type: expected integer, got string
+property "port" validation failed: wrong type: expected integer, got string
 done
 --- no_error_log
 [error]
@@ -110,13 +103,9 @@ done
                  ngx.HTTP_PUT,
                  [[{
                         "plugins": {
-                            "kafka-logger": {
-                                "broker_list" :
-                                  {
-                                    "127.0.0.1":9092
-                                  },
-                                "kafka_topic" : "test2",
-                                "key" : "key1"
+                            "syslog": {
+                                "host" : "127.0.0.1",
+                                "port" : 5044
                             }
                         },
                         "upstream": {
@@ -131,14 +120,10 @@ done
                     "node": {
                         "value": {
                             "plugins": {
-                                 "kafka-logger": {
-                                    "broker_list" :
-                                      {
-                                        "127.0.0.1":9092
-                                      },
-                                    "kafka_topic" : "test2",
-                                    "key" : "key1"
-                                }
+                              "syslog": {
+                                 "host" : "127.0.0.1",
+                                 "port" : 5044
+                              }
                             },
                             "upstream": {
                                 "nodes": {
@@ -179,7 +164,43 @@ hello world
 
 
 
-=== TEST 6: error log
+=== TEST 6: flush manually
+--- config
+    location /t {
+        content_by_lua_block {
+            local plugin = require("apisix.plugins.syslog")
+            local logger_socket = require "resty.logger.socket"
+            local logger, err = logger_socket:new({
+                    host = "127.0.0.1",
+                    port = 5044,
+                    flush_limit = 100,
+            })
+
+            local bytes, err = logger:log("abc")
+            if err then
+                ngx.log(ngx.ERR, err)
+            end
+
+            local bytes, err = logger:log("efg")
+            if err then
+                ngx.log(ngx.ERR, err)
+            end
+
+            local ok, err = plugin.flush_syslog(logger)
+            if not ok then
+                ngx.say(err)
+            end
+            ngx.say("done")
+        }
+    }
+--- request
+GET /t
+--- no_error_log
+[error]
+
+
+
+=== TEST 7: small flush_limit, instant flush
 --- config
     location /t {
         content_by_lua_block {
@@ -188,16 +209,11 @@ hello world
                  ngx.HTTP_PUT,
                  [[{
                         "plugins": {
-                             "kafka-logger": {
-                                    "broker_list" :
-                                      {
-                                        "127.0.0.1":9092,
-                                        "127.0.0.1":9093
-                                      },
-                                    "kafka_topic" : "test2",
-                                    "key" : "key1",
-                                    "batch_max_size": 1
-                             }
+                            "syslog": {
+                                 "host" : "127.0.0.1",
+                                 "port" : 5044,
+                                 "flush_limit" : 1
+                              }
                         },
                         "upstream": {
                             "nodes": {
@@ -211,16 +227,11 @@ hello world
                     "node": {
                         "value": {
                             "plugins": {
-                                "kafka-logger": {
-                                    "broker_list" :
-                                      {
-                                        "127.0.0.1":9092,
-                                        "127.0.0.1":9093
-                                      },
-                                    "kafka_topic" : "test2",
-                                    "key" : "key1",
-                                    "batch_max_size": 1
-                                }
+                                "syslog": {
+                                 "host" : "127.0.0.1",
+                                 "port" : 5044,
+                                 "flush_limit" : 1
+                              }
                             },
                             "upstream": {
                                 "nodes": {
@@ -235,10 +246,13 @@ hello world
                     "action": "set"
                 }]]
                 )
+
             if code >= 300 then
                 ngx.status = code
             end
+
             ngx.say(body)
+
             local http = require "resty.http"
             local httpc = http.new()
             local uri = "http://127.0.0.1:" .. ngx.var.server_port .. "/hello"
@@ -246,8 +260,8 @@ hello world
         }
     }
 --- request
-GET /t
---- error_log
-failed to send data to Kafka topic
+GET /hello
+hello world
+--- no_error_log
 [error]
---- wait: 1
+--- wait: 0.2

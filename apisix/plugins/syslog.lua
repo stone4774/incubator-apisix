@@ -17,33 +17,38 @@
 local core = require("apisix.core")
 local log_util = require("apisix.utils.log-util")
 local batch_processor = require("apisix.utils.batch-processor")
-local plugin_name = "udp-logger"
-local tostring = tostring
-local buffers = {}
+local logger_socket = require("resty.logger.socket")
+local plugin_name = "syslog"
 local ngx = ngx
-local udp = ngx.socket.udp
-local ipairs   = ipairs
-local stale_timer_running = false;
-local timer_at = ngx.timer.at
+local buffers = {}
 
 local schema = {
     type = "object",
     properties = {
         host = {type = "string"},
-        port = {type = "integer", minimum = 0},
+        port = {type = "integer"},
+        name = {type = "string", default = "sys logger"},
+        flush_limit = {type = "integer", minimum = 1, default = 4096},
+        drop_limit = {type = "integer", default = 1048576},
         timeout = {type = "integer", minimum = 1, default = 3},
-        name = {type = "string", default = "udp logger"},
-        buffer_duration = {type = "integer", minimum = 1, default = 60},
-        inactive_timeout = {type = "integer", minimum = 1, default = 5},
+        sock_type = {type = "string", default = "tcp"},
+        max_retry_times = {type = "integer", minimum = 1, default = 1},
+        retry_interval = {type = "integer", minimum = 0, default = 1},
+        pool_size = {type = "integer", minimum = 5, default = 5},
+        tls = {type = "boolean", default = false},
         batch_max_size = {type = "integer", minimum = 1, default = 1000},
+        buffer_duration = {type = "integer", minimum = 1, default = 60},
     },
     required = {"host", "port"}
 }
 
+local lrucache = core.lrucache.new({
+    ttl = 300, count = 512
+})
 
 local _M = {
     version = 0.1,
-    priority = 400,
+    priority = 401,
     name = plugin_name,
     schema = schema,
 }
@@ -52,66 +57,64 @@ function _M.check_schema(conf)
     return core.schema.check(schema, conf)
 end
 
-local function send_udp_data(conf, log_message)
+function _M.flush_syslog(logger)
+    local ok, err = logger:flush(logger)
+    if not ok then
+        core.log.error("failed to flush message:", err)
+    end
+end
+
+local function send_syslog_data(conf, log_message)
     local err_msg
     local res = true
-    local sock = udp()
-    sock:settimeout(conf.timeout * 1000)
-    local ok, err = sock:setpeername(conf.host, conf.port)
 
-    if not ok then
-        return nil, "failed to connect to UDP server: host[" .. conf.host
-                    .. "] port[" .. tostring(conf.port) .. "] err: " .. err
+    -- fetch api_ctx
+    local api_ctx = ngx.ctx.api_ctx
+    if not api_ctx then
+        core.log.error("invalid api_ctx cannot proceed with sys logger plugin")
+        return core.response.exit(500)
     end
 
-    ok, err = sock:send(log_message)
+    -- fetch it from lrucache
+    local logger, err =  lrucache(api_ctx.conf_type .. "#" .. api_ctx.conf_id, api_ctx.conf_version,
+        logger_socket.new, logger_socket, {
+            host = conf.host,
+            port = conf.port,
+            flush_limit = conf.flush_limit,
+            drop_limit = conf.drop_limit,
+            timeout = conf.timeout,
+            sock_type = conf.sock_type,
+            max_retry_times = conf.max_retry_times,
+            retry_interval = conf.retry_interval,
+            pool_size = conf.pool_size,
+            tls = conf.tls,
+        })
+
+    if not logger then
+        res = false
+        err_msg = "failed when initiating the sys logger processor".. err
+    end
+
+    -- reuse the logger object
+    local ok, err = logger:log(core.json.encode(log_message))
     if not ok then
         res = false
-        err_msg = "failed to send data to UDP server: host[" .. conf.host
-                  .. "] port[" .. tostring(conf.port) .. "] err:" .. err
-    end
-
-    ok, err = sock:close()
-    if not ok then
-        core.log.error("failed to close the UDP connection, host[",
-                        conf.host, "] port[", conf.port, "] ", err)
+        err_msg = "failed to log message" .. err
     end
 
     return res, err_msg
 end
 
-
-local function remove_stale_objects(premature)
-    if premature then
-        return
-    end
-
-    for key, batch in ipairs(buffers) do
-        if #batch.entry_buffer.entries == 0 and #batch.batch_to_process == 0 then
-            core.log.debug("removing batch processor stale object, route id:", tostring(key))
-            buffers[key] = nil
-        end
-    end
-
-    stale_timer_running = false
-end
-
-
+-- log phase in APISIX
 function _M.log(conf)
     local entry = log_util.get_full_log(ngx)
 
     if not entry.route_id then
-        core.log.error("failed to obtain the route id for udp logger")
+        core.log.error("failed to obtain the route id for sys logger")
         return
     end
 
     local log_buffer = buffers[entry.route_id]
-
-    if not stale_timer_running then
-        -- run the timer every 30 mins if any log is present
-        timer_at(1800, remove_stale_objects)
-        stale_timer_running = true
-    end
 
     if log_buffer then
         log_buffer:push(entry)
@@ -131,16 +134,16 @@ function _M.log(conf)
             return false, 'error occurred while encoding the data: ' .. err
         end
 
-        return send_udp_data(conf, data)
+        return send_syslog_data(conf, data)
     end
 
     local config = {
         name = conf.name,
-        retry_delay = conf.retry_delay,
+        retry_delay = conf.retry_interval,
         batch_max_size = conf.batch_max_size,
-        max_retry_count = conf.max_retry_count,
+        max_retry_count = conf.max_retry_times,
         buffer_duration = conf.buffer_duration,
-        inactive_timeout = conf.inactive_timeout,
+        inactive_timeout = conf.timeout,
     }
 
     local err
@@ -153,6 +156,7 @@ function _M.log(conf)
 
     buffers[entry.route_id] = log_buffer
     log_buffer:push(entry)
+
 end
 
 return _M
