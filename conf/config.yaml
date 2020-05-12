@@ -147,5 +147,6 @@ plugins:                          # plugin list
   - cors
   - syslog
   - batch-requests
+  - weighted-upstream
 stream_plugins:
   - mqtt-proxy
